@@ -25,27 +25,52 @@
   // ---------- хранение ----------
   const KEY = 'stupenki-v1';
   const fresh = () => ({ v: 1, tested: false, levels: { vocab: 0, grammar: 0, reading: 0 }, mastery: {}, cards: {}, xp: 0, streak: { n: 0, last: null }, sessions: 0, sound: true });
-  function load() { try { const s = JSON.parse(localStorage.getItem(KEY)); if (s && s.v === 1) return s; } catch (e) {} return null; }
+  // Данные из localStorage и облака не доверенные: приводим к ожидаемой форме,
+  // чтобы кривой или чужой JSON не ломал экраны (например, уровень 99 → LEVELS[99]).
+  function normalize(s) {
+    if (!s || typeof s !== 'object' || s.v !== 1) return null;
+    const obj = x => (x && typeof x === 'object' && !Array.isArray(x) ? x : {});
+    const num = x => (Number.isFinite(+x) ? +x : 0);
+    const out = Object.assign(fresh(), s);
+    const lv = obj(s.levels);
+    out.levels = {};
+    for (const k of SKILL_IDS) out.levels[k] = Math.min(MAXL, Math.max(0, Math.round(num(lv[k]))));
+    out.mastery = obj(s.mastery);
+    out.cards = obj(s.cards);
+    const st = obj(s.streak);
+    out.streak = { n: num(st.n), last: typeof st.last === 'string' ? st.last : null };
+    out.xp = num(s.xp); out.sessions = num(s.sessions); out.savedAt = num(s.savedAt);
+    out.sound = s.sound !== false;
+    return out;
+  }
+  function load() { try { return normalize(JSON.parse(localStorage.getItem(KEY))); } catch (e) {} return null; }
   function saveLocal() { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {} }
   function save() { S.savedAt = Date.now(); saveLocal(); cloudSave(); }
   let S = load() || fresh();
 
   // ---------- облако (Supabase) ----------
   // Настройки в config.js; пустой url — работаем только с localStorage.
-  // Весь обмен с базой — две RPC-функции (load_progress / save_progress), см. supabase/schema.sql.
-  // Чтобы сменить базу, достаточно переписать rpc(), cloudLoad() и cloudSave().
+  // PIN отправляется только при входе (stupenki_login) и нигде не хранится;
+  // дальше устройство работает по случайному токену сессии. См. supabase/schema.sql.
+  // Чтобы сменить базу, достаточно переписать rpc() и функции cloud*.
   const CFG = window.STUPENKI_CLOUD || {};
-  const CLOUD = CFG.url && CFG.key ? CFG : null;
+  const CLOUD = CFG.url && CFG.key && /^https:\/\//.test(CFG.url) ? CFG : null;
   const PROFILE_KEY = 'stupenki-profile';
-  let profile = null;
-  try { profile = JSON.parse(localStorage.getItem(PROFILE_KEY)); } catch (e) {}
+  let profile = null; // { name, token }
+  try {
+    const p = JSON.parse(localStorage.getItem(PROFILE_KEY));
+    if (p && typeof p.name === 'string') profile = p;
+  } catch (e) {}
   let saveTimer = null, savePending = false, syncState = 'idle';
 
   async function rpc(fn, body, keepalive) {
+    const payload = JSON.stringify(body);
     const r = await fetch(CLOUD.url.replace(/\/+$/, '') + '/rest/v1/rpc/' + fn, {
-      method: 'POST', keepalive: !!keepalive,
+      method: 'POST',
+      // keepalive даёт запросу пережить закрытие вкладки, но браузеры ограничивают его 64 КБ
+      keepalive: !!keepalive && payload.length < 60000,
       headers: { 'Content-Type': 'application/json', apikey: CLOUD.key },
-      body: JSON.stringify(body),
+      body: payload,
     });
     if (!r.ok) throw new Error('http ' + r.status);
     return r.json();
@@ -55,37 +80,77 @@
     const el = document.getElementById('sync-chip');
     if (el) { el.dataset.state = st; el.title = SYNC_TITLES[st]; }
   }
-  const cloudLoad = () => rpc('load_progress', { p_name: profile.name, p_pin: profile.pin });
+  function storeProfile() {
+    try { profile ? localStorage.setItem(PROFILE_KEY, JSON.stringify(profile)) : localStorage.removeItem(PROFILE_KEY); } catch (e) {}
+  }
+  // Сессия устройства больше не действует (выход на всех устройствах, смена PIN):
+  // прогресс на устройстве оставляем, просим войти заново.
+  function sessionLost() {
+    clearTimeout(saveTimer); savePending = false;
+    profile = null; storeProfile();
+    loginScreen('Сессия на этом устройстве завершена — войдите снова.');
+  }
   function cloudSave(now) {
-    if (!CLOUD || !profile) return;
+    if (!CLOUD || !profile || !profile.token) return;
     clearTimeout(saveTimer);
     savePending = true;
     const run = () => {
       savePending = false;
+      if (!profile || !profile.token) return;
       setSync('saving');
-      rpc('save_progress', { p_name: profile.name, p_pin: profile.pin, p_data: S }, now)
-        .then(res => setSync(res && res.status === 'ok' ? 'saved' : 'error'))
+      return rpc('stupenki_save', { p_token: profile.token, p_data: S }, now)
+        .then(res => {
+          if (res && res.status === 'no_session') return sessionLost();
+          setSync(res && res.status === 'ok' ? 'saved' : 'error');
+        })
         .catch(() => setSync('offline'));
     };
-    if (now) run(); else saveTimer = setTimeout(run, 1500);
+    if (now) return run();
+    saveTimer = setTimeout(run, 1500);
   }
-  // подтянуть прогресс, если на другом устройстве он новее
+  // Сверка с облаком: берём более свежую версию, свою — отправляем, если она новее.
   async function cloudPull() {
-    if (!CLOUD || !profile) return;
+    if (!CLOUD || !profile || !profile.token) return;
     try {
-      const res = await cloudLoad();
-      if (res.status === 'wrong_pin') { logout(); return; }
-      if (res.status === 'ok' && res.data && res.data.v === 1 && (res.data.savedAt || 0) > (S.savedAt || 0)) {
-        S = res.data; saveLocal();
+      const res = await rpc('stupenki_load', { p_token: profile.token });
+      if (res.status === 'no_session') return sessionLost();
+      const remote = normalize(res.data);
+      if (remote && remote.savedAt > (S.savedAt || 0)) {
+        S = remote; saveLocal();
         if (!document.querySelector('.session')) home();
-      }
-      setSync('saved');
+        setSync('saved');
+      } else if (!remote || remote.savedAt < (S.savedAt || 0)) {
+        cloudSave(true);
+      } else setSync('saved');
     } catch (e) { setSync('offline'); }
   }
-  function logout() {
+  async function logout() {
+    const p = profile;
+    clearTimeout(saveTimer); savePending = false;
+    if (p && p.token) {
+      try { await rpc('stupenki_save', { p_token: p.token, p_data: S }); } catch (e) {}
+      rpc('stupenki_logout', { p_token: p.token }).catch(() => {});
+    }
     profile = null; S = fresh();
-    try { localStorage.removeItem(PROFILE_KEY); localStorage.removeItem(KEY); } catch (e) {}
+    storeProfile(); saveLocal();
     loginScreen();
+  }
+  // Вход версии 1 хранил на устройстве PIN. Один раз меняем его на токен и забываем PIN.
+  async function migrateLegacyProfile() {
+    const pin = profile.pin;
+    delete profile.pin; storeProfile();
+    try {
+      const res = await rpc('stupenki_login', { p_name: profile.name, p_pin: pin });
+      if (res.token) {
+        profile.token = res.token; storeProfile();
+        const remote = normalize(res.data);
+        if (remote && remote.savedAt > (S.savedAt || 0)) { S = remote; saveLocal(); }
+        home(); cloudPull();
+        return;
+      }
+    } catch (e) {}
+    profile = null; storeProfile();
+    loginScreen('Обновили защиту входа — введите имя и PIN ещё раз.');
   }
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden' && savePending) cloudSave(true);
@@ -683,7 +748,7 @@
     const label = h('span', {}, profile.name);
     const b = h('button', { class: 'stat sync', id: 'sync-chip', type: 'button', 'data-state': syncState, title: SYNC_TITLES[syncState] }, h('i', { class: 'sync-dot', 'aria-hidden': 'true' }), label);
     b.addEventListener('click', () => {
-      if (armed) { cloudSave(true); return logout(); }
+      if (armed) return logout();
       armed = true; label.textContent = 'Выйти?';
       clearTimeout(timer);
       timer = setTimeout(() => { armed = false; label.textContent = profile ? profile.name : ''; }, 2500);
@@ -692,7 +757,7 @@
   }
 
   function loginScreen(msg) {
-    const name = h('input', { id: 'login-name', class: 'field', autocomplete: 'username', placeholder: 'Например, Аня', maxlength: '30', value: profile ? profile.name : '' });
+    const name = h('input', { id: 'login-name', class: 'field', autocomplete: 'username', autocapitalize: 'off', spellcheck: 'false', placeholder: 'Например, Аня', maxlength: '30' });
     const pin = h('input', { id: 'login-pin', class: 'field', type: 'password', inputmode: 'numeric', autocomplete: 'current-password', placeholder: 'Не меньше 4 цифр', maxlength: '12' });
     const err = h('p', { class: 'form-err', role: 'alert', hidden: !msg }, msg || '');
     const btn = h('button', { class: 'btn primary xl', type: 'submit' }, 'Войти');
@@ -709,14 +774,20 @@
       const n = name.value.trim(), p = pin.value.trim();
       if (!n || !/^\d{4,12}$/.test(p)) return fail('Введите имя и PIN из 4–12 цифр.');
       btn.disabled = true; btn.textContent = 'Входим…';
-      const prev = profile;
-      profile = { name: n, pin: p };
+      // отложенное сохранение прежнего профиля не должно уйти в новый
+      clearTimeout(saveTimer); savePending = false;
       let res;
-      try { res = await cloudLoad(); } catch (x) { profile = prev; return fail('Нет связи с базой. Проверьте интернет или продолжите без входа.'); }
-      if (res.status === 'wrong_pin') { profile = prev; return fail('Неверный PIN для этого имени.'); }
-      if (res.status === 'limit') { profile = prev; return fail('Достигнут лимит профилей — новый создать нельзя.'); }
-      try { localStorage.setItem(PROFILE_KEY, JSON.stringify(profile)); } catch (x) {}
-      if (res.status === 'ok' && res.data && res.data.v === 1) { S = res.data; saveLocal(); setSync('saved'); }
+      try { res = await rpc('stupenki_login', { p_name: n, p_pin: p }); }
+      catch (x) { return fail('Нет связи с базой. Проверьте интернет или продолжите без входа.'); }
+      pin.value = '';
+      if (res.status === 'wrong_pin') return fail('Неверный PIN для этого имени.');
+      if (res.status === 'locked') return fail(`Слишком много неверных попыток. Вход закрыт ещё на ${Math.ceil((res.seconds || 60) / 60)} мин.`);
+      if (res.status === 'limit') return fail('Достигнут лимит профилей — новый создать нельзя.');
+      if (!res.token) return fail('Не удалось войти. Попробуйте ещё раз.');
+      profile = { name: n, token: res.token };
+      storeProfile();
+      const remote = normalize(res.data);
+      if (remote) { S = remote; saveLocal(); setSync('saved'); }
       else cloudSave(true); // новый профиль: забираем прогресс с этого устройства
       home();
     });
@@ -735,7 +806,7 @@
         h('button', { class: 'btn ghost xl', type: 'button', onclick: () => { S.onboarded = true; save(); home(); } }, 'Я начинаю с нуля', h('small', {}, 'Сразу к первым словам'))),
       h('ul', { class: 'pillars' },
         h('li', {}, h('b', {}, 'Тест по шкале CEFR'), ' от A0 до C2 — вопросы подстраиваются под ответы'),
-        h('li', {}, h('b', {}, '10 форматов-игр'), ' — карточки, поиск на картинке, пары, сборка слов и фраз'),
+        h('li', {}, h('b', {}, '11 форматов-игр'), ' — карточки, поиск на картинке, пары, сборка слов и фраз'),
         h('li', {}, h('b', {}, 'Интервальные повторения'), ' — ошибки возвращаются, выученное не теряется'))));
   }
 
@@ -773,6 +844,7 @@
       if (i >= plan.length) return finishTest();
       const skill = plan[i], L = lv[skill];
       const t = testTask(skill, L, usedTopics, used);
+      if (!t) { i++; return step(); } // вопросы темы закончились — пропускаем шаг
       t.keys.forEach(k => used.add(k));
       const bar = h('div', { class: 'progress' }, h('i', { style: `width:${(i / plan.length) * 100}%` }));
       let answered = false;
@@ -781,7 +853,7 @@
         log[skill].push({ L, ok }); results.push({ topic: t.topic, ok });
         const stepSize = log[skill].length <= 2 ? 2 : 1;
         lv[skill] = ok ? Math.min(MAXL, L + stepSize) : Math.max(0, L - stepSize);
-        i++; setTimeout(step, ok === null ? 0 : 380);
+        i++; setTimeout(step, 380);
       };
       show(h('main', { class: 'wrap session' },
         h('div', { class: 'session-head' },
@@ -800,9 +872,14 @@
         }
         S.levels[s] = level;
       }
-      // стартовая карта знаний по темам
-      S.mastery = {};
-      results.forEach(r => { if (!r.topic) return; const x = S.mastery[r.topic] || { m: 0.45, n: 0 }; x.m = r.ok ? Math.max(x.m, 0.75) : Math.min(x.m, 0.25); x.n = 1; S.mastery[r.topic] = x; });
+      // карта знаний: темы из теста получают оценку, остальное (накопленное тренировками) не трогаем
+      results.forEach(r => {
+        if (!r.topic) return;
+        const x = S.mastery[r.topic] || { m: 0.45, n: 0 };
+        x.m = r.ok ? Math.max(x.m, 0.75) : Math.min(x.m, 0.25);
+        x.n = Math.max(1, x.n);
+        S.mastery[r.topic] = x;
+      });
       S.tested = true; save();
       testResult(results);
     }
@@ -917,6 +994,7 @@
 
   // --- проход по заданиям ---
   function runSession(tasks, mode, gameKind) {
+    if (!tasks || !tasks.length) return home();
     const queue = tasks.slice();
     let idx = 0, correct = 0, answered = 0;
     const xpStart = S.xp;
@@ -1007,6 +1085,7 @@
   });
   if (TTS) try { speechSynthesis.getVoices(); } catch (e) {}
 
-  if (CLOUD && !profile) loginScreen();
+  if (CLOUD && profile && profile.pin && !profile.token) migrateLegacyProfile();
+  else if (CLOUD && !(profile && profile.token)) loginScreen();
   else { home(); cloudPull(); }
 })();

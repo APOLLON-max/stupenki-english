@@ -14,7 +14,7 @@
 ## Облачное сохранение (Supabase)
 
 1. Создать проект на supabase.com.
-2. SQL Editor → выполнить [supabase/schema.sql](supabase/schema.sql).
+2. SQL Editor → выполнить [supabase/schema.sql](supabase/schema.sql) (файл можно запускать повторно — он же обновляет старую схему).
 3. Вписать Project URL и publishable (anon) key в [config.js](config.js).
 
 Без настройки сайт работает, прогресс хранится только в браузере.
