@@ -1,7 +1,9 @@
 # Ступеньки English — спецификация
 
 Веб-тренажёр английского для взрослых: с нуля и для тех, кто уже знает язык. Уровни от A0 до C2.
-Опубликован как артефакт Claude: https://claude.ai/artifact/1a1Rd8gjf7843Qc9411Qfd
+- Сайт: https://apollon-max.github.io/stupenki-english/
+- Репозиторий: https://github.com/APOLLON-max/stupenki-english
+- Старая версия без облака (артефакт Claude): https://claude.ai/artifact/1a1Rd8gjf7843Qc9411Qfd
 
 ## 1. Что умеет продукт
 
