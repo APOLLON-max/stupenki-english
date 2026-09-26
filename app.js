@@ -93,13 +93,20 @@
   });
 
   // ---------- звук ----------
-  // Основной путь: заранее записанные mp3 (audio/*.json) через Web Audio.
-  // Запасной: голос браузера (Web Speech API), если записи не загрузились.
+  // Основной путь: заранее записанные mp3 (audio/*.json) через один общий <audio>.
+  // Не Web Audio: на iPhone Web Audio молчит при включённом беззвучном режиме,
+  // а <audio> играет. Запуск синхронный — iOS разрешает звук только прямо в обработчике нажатия.
+  // Запасной путь: голос браузера (Web Speech API), если записи ещё не загрузились.
   const TTS = 'speechSynthesis' in window;
-  const bank = {}, buffers = {};
-  let actx, current;
+  const bank = {};
+  let actx;
   ['words', 'sentences'].forEach(f => fetch('audio/' + f + '.json').then(r => (r.ok ? r.json() : {})).then(j => Object.assign(bank, j)).catch(() => {}));
   const canSpeak = () => TTS || Object.keys(bank).length > 0;
+  const player = new Audio();
+  player.preload = 'auto';
+  player.setAttribute('playsinline', '');
+  const SILENT = 'data:audio/mpeg;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjYyLjEyLjEwMAAAAAAAAAAAAAAA//NwwAAAAAAAAAAAAEluZm8AAAAPAAAACAAAA/oAR0dHR0dHR0dHR0dHYmJiYmJiYmJiYmJifHx8fHx8fHx8fHx8fJaWlpaWlpaWlpaWlrGxsbGxsbGxsbGxsbHLy8vLy8vLy8vLy8vl5eXl5eXl5eXl5eXl////////////////AAAAAExhdmM2Mi4yOAAAAAAAAAAAAAAAACQC1AAAAAAAAAP6YbndKQAAAAAAAAAAAAAAAAD/80DEAAAAA0gAAAAATEFNRTMuOTkuNVVVVVVVVVVVVUxBTUUzLjk5LjVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVf/zQsRbAAADSAAAAABVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjk5LjVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVf/zQMSkAAADSAAAAABVVVVVVVVVVVVVVVVVVVVVVVVVTEFNRTMuOTkuNVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//NCxKMAAANIAAAAAFVVVVVVVVVVVVVVVVVVVVVVVVVVTEFNRTMuOTkuNVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//NAxKQAAANIAAAAAFVVVVVVVVVVVVVVVVVVVVVVVVVMQU1FMy45OS41VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVX/80LEowAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVMQU1FMy45OS41VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVX/80DEpAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVf/zQsSjAAADSAAAAABVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVQ==';
+  let unlocked = false;
   function audioCtx() {
     try {
       actx = actx || new (window.AudioContext || window.webkitAudioContext)();
@@ -107,26 +114,37 @@
     } catch (e) {}
     return actx;
   }
-  document.addEventListener('pointerdown', audioCtx, { once: true });
-  async function speak(text) {
+  // Первое касание: «разблокируем» плеер беззвучным клипом, чтобы потом звук мог
+  // запускаться и сам (автоозвучка в «Послушай и выбери»).
+  function unlockAudio() {
+    audioCtx();
+    if (unlocked) return;
+    unlocked = true;
+    try {
+      player.src = SILENT;
+      const p = player.play();
+      // AbortError — беззвучный клип прервала настоящая озвучка, это нормально
+      if (p && p.catch) p.catch(err => { if (err && err.name === 'NotAllowedError') unlocked = false; });
+    } catch (e) { unlocked = false; }
+  }
+  ['touchend', 'click', 'keydown'].forEach(ev => document.addEventListener(ev, unlockAudio, { capture: true, passive: true }));
+  function speak(text) {
     if (!S.sound || !text) return;
     const b64 = bank[text];
-    const c = b64 && audioCtx();
-    if (c) {
+    if (b64) {
       try {
-        let buf = buffers[text];
-        if (!buf) {
-          const bin = atob(b64), u = new Uint8Array(bin.length);
-          for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
-          buf = buffers[text] = await c.decodeAudioData(u.buffer);
-        }
-        if (current) try { current.stop(); } catch (e) {}
-        const src = c.createBufferSource();
-        src.buffer = buf; src.connect(c.destination); src.start();
-        current = src;
+        if (TTS) speechSynthesis.cancel();
+        player.pause();
+        player.src = 'data:audio/mpeg;base64,' + b64;
+        player.currentTime = 0;
+        const p = player.play();
+        if (p && p.catch) p.catch(() => ttsSpeak(text));
         return;
       } catch (e) {}
     }
+    ttsSpeak(text);
+  }
+  function ttsSpeak(text) {
     if (!TTS) return;
     try {
       speechSynthesis.cancel();
@@ -134,7 +152,7 @@
       u.lang = 'en-US'; u.rate = 0.85;
       const v = speechSynthesis.getVoices().find(v => /^en[-_]US/i.test(v.lang));
       if (v) u.voice = v;
-      setTimeout(() => { speechSynthesis.resume(); speechSynthesis.speak(u); }, 60);
+      speechSynthesis.speak(u);
     } catch (e) {}
   }
   function beep(ok) {
